@@ -323,9 +323,9 @@ const monoFont = "'IBM Plex Mono', monospace";
 let nextMemberId = 2;
 
 export default function PlumPersonalDemo() {
-  const adminKeyFromUrl = new URLSearchParams(window.location.search).get("admin");
-  if (adminKeyFromUrl) {
-    return <AdminView adminKey={adminKeyFromUrl} />;
+  const isAdminRoute = new URLSearchParams(window.location.search).has("admin");
+  if (isAdminRoute) {
+    return <AdminView />;
   }
   return <MainApp />;
 }
@@ -772,26 +772,52 @@ function Chip({ active, onClick, children, tone }) {
 }
 
 // ---------------------------------------------------------------------------
-// lead storage — centralized via the leads Netlify function (Netlify Blobs
-// server-side). saving is open to anyone using the app; reading everything
-// back (for export) requires the admin key and only happens in AdminView.
+// lead storage — Supabase (real Postgres table + file storage bucket).
+// the anon key below is meant to be public in frontend code — that's normal
+// for Supabase; access control is enforced by Row Level Security policies
+// on the database side, not by hiding this key. see setup notes at the
+// bottom of this file for the SQL to run in your Supabase project.
 // ---------------------------------------------------------------------------
+import { createClient } from "@supabase/supabase-js";
+
+const SUPABASE_URL = "https://zvqldnykeihoyavrjrdv.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp2cWxkbnlrZWlob3lhdnJqcmR2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxMjcwODUsImV4cCI6MjEwMjcwMzA4NX0.2LFJ1TzJKruG7ul9KnrC9N73k6YtRj1Ufx3WKcrIg-0";
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
 async function saveLeadToServer(lead) {
-  const res = await fetch("/.netlify/functions/leads", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(lead),
+  const { error } = await supabase.from("leads").insert({
+    lead_name: lead.leadName,
+    lead_pincode: lead.leadPincode,
+    members: lead.members,
+    shared_policies: lead.sharedPolicies,
   });
-  if (!res.ok) throw new Error("could not save lead");
-  return res.json();
+  if (error) throw new Error(error.message);
 }
 
-async function fetchAllLeads(adminKey) {
-  const res = await fetch(`/.netlify/functions/leads?key=${encodeURIComponent(adminKey)}`);
-  if (res.status === 401) throw new Error("wrong admin key");
-  if (!res.ok) throw new Error("could not load leads");
-  const data = await res.json();
-  return data.leads || [];
+async function fetchAllLeads() {
+  const { data, error } = await supabase.from("leads").select("*").order("saved_at", { ascending: false });
+  if (error) throw new Error(error.message);
+  return data.map((row) => ({
+    leadName: row.lead_name,
+    leadPincode: row.lead_pincode,
+    members: row.members,
+    sharedPolicies: row.shared_policies,
+    savedAt: row.saved_at,
+  }));
+}
+
+async function uploadCheckupFile(file) {
+  const path = `checkups/${Date.now()}-${file.name}`;
+  const { error } = await supabase.storage.from("checkup-documents").upload(path, file);
+  if (error) throw new Error(error.message);
+  return path;
+}
+
+async function getCheckupFileUrl(path) {
+  const { data, error } = await supabase.storage.from("checkup-documents").createSignedUrl(path, 3600);
+  if (error) throw new Error(error.message);
+  return data.signedUrl;
 }
 
 function exportLeadsToExcel(leads) {
@@ -806,6 +832,7 @@ function exportLeadsToExcel(leads) {
         age: m.age,
         "medical conditions": m.conditions.join(", "),
         "checkup date": m.checkupDate || "",
+        "checkup file": m.checkupFile?.fileName || "",
         "recommended policies": lead.sharedPolicies.map((c) => POLICIES[c]?.name).join(", ") || "none shared",
       });
     });
@@ -824,7 +851,7 @@ function FindMyPlanView() {
   const [leadName, setLeadName] = useState("");
   const [leadPincode, setLeadPincode] = useState("");
   const [members, setMembers] = useState([
-    { id: 1, relation: "self", age: 32, conditions: [], checkupDate: null, checkupFile: null, parsing: false, parseError: null },
+    { id: 1, relation: "self", age: 32, conditions: [], checkupDate: "", checkupFile: null, uploading: false, uploadError: null },
   ]);
   const [submitted, setSubmitted] = useState(false);
   const [floaterPolicy, setFloaterPolicy] = useState(null);
@@ -835,7 +862,7 @@ function FindMyPlanView() {
     const id = nextMemberId++;
     setMembers([
       ...members,
-      { id, relation: "spouse", age: 30, conditions: [], checkupDate: null, checkupFile: null, parsing: false, parseError: null },
+      { id, relation: "spouse", age: 30, conditions: [], checkupDate: "", checkupFile: null, uploading: false, uploadError: null },
     ]);
   }
 
@@ -857,48 +884,27 @@ function FindMyPlanView() {
     );
   }
 
-  function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result.split(",")[1]);
-      reader.onerror = () => reject(new Error("could not read file"));
-      reader.readAsDataURL(file);
-    });
-  }
-
-  const MAX_FILE_BYTES = 4 * 1024 * 1024; // 4MB — keeps stored leads reasonably sized
+  const MAX_FILE_BYTES = 4 * 1024 * 1024; // 4MB — keeps things reasonable for a demo
 
   async function handleCheckupUpload(memberId, file) {
     if (!file) return;
     if (file.size > MAX_FILE_BYTES) {
-      updateMember(memberId, { parseError: "file too large — please use one under 4MB" });
+      updateMember(memberId, { uploadError: "file too large — please use one under 4MB" });
       return;
     }
-    updateMember(memberId, { parsing: true, parseError: null });
+    updateMember(memberId, { uploading: true, uploadError: null });
     try {
-      const base64 = await fileToBase64(file);
-      const res = await fetch("/.netlify/functions/parse-checkup", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: base64, mediaType: file.type }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "parsing failed");
-
-      const member = members.find((m) => m.id === memberId);
-      const mergedConditions = [...new Set([...(member?.conditions || []), ...(data.conditions || [])])];
-
+      const path = await uploadCheckupFile(file);
       updateMember(memberId, {
-        conditions: mergedConditions,
-        checkupDate: data.checkupDate || member.checkupDate,
-        // the actual uploaded document is kept here, not just what Claude
-        // extracted from it — this is what makes it into the saved lead
-        checkupFile: { base64, mediaType: file.type, fileName: file.name },
-        parsing: false,
-        parseError: null,
+        // the source document is stored in Supabase Storage — this just
+        // keeps a reference to it. conditions and date are entered
+        // manually below, not auto-extracted.
+        checkupFile: { path, fileName: file.name, mediaType: file.type },
+        uploading: false,
+        uploadError: null,
       });
     } catch (err) {
-      updateMember(memberId, { parsing: false, parseError: err.message });
+      updateMember(memberId, { uploading: false, uploadError: err.message });
     }
   }
 
@@ -996,27 +1002,34 @@ function FindMyPlanView() {
 
               <div style={{ marginTop: 12 }}>
                 <div style={{ fontSize: 11, color: inkSoft, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 6 }}>
-                  upload health checkup — image or pdf (optional, auto-fills conditions below)
+                  upload health checkup — image or pdf (optional, stored with this lead)
                 </div>
                 <input
                   type="file"
                   accept="image/*,application/pdf"
                   onChange={(e) => handleCheckupUpload(m.id, e.target.files[0])}
                   style={{ fontSize: 12, fontFamily: bodyFont }}
-                  disabled={m.parsing}
+                  disabled={m.uploading}
                 />
-                {m.parsing && <div style={{ fontSize: 12, color: teal, marginTop: 6 }}>reading report…</div>}
-                {m.parseError && <div style={{ fontSize: 12, color: red, marginTop: 6 }}>couldn't read that file: {m.parseError}</div>}
-                {m.checkupFile && !m.parsing && (
+                {m.uploading && <div style={{ fontSize: 12, color: teal, marginTop: 6 }}>uploading…</div>}
+                {m.uploadError && <div style={{ fontSize: 12, color: red, marginTop: 6 }}>couldn't upload: {m.uploadError}</div>}
+                {m.checkupFile && !m.uploading && (
                   <div style={{ fontSize: 12, color: inkSoft, marginTop: 6 }}>
                     ✓ attached: <span style={{ fontFamily: monoFont }}>{m.checkupFile.fileName}</span>
-                    {m.checkupDate && (
-                      <>
-                        {" "}· date parsed: <span style={{ fontFamily: monoFont }}>{m.checkupDate}</span>
-                      </>
-                    )}
                   </div>
                 )}
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 11, color: inkSoft, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 6 }}>
+                  checkup date (enter manually)
+                </div>
+                <input
+                  type="date"
+                  value={m.checkupDate || ""}
+                  onChange={(e) => updateMember(m.id, { checkupDate: e.target.value })}
+                  style={{ padding: "7px 10px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13, fontFamily: bodyFont }}
+                />
               </div>
 
               <div style={{ marginTop: 10 }}>
@@ -1209,13 +1222,27 @@ function PolicyCard({ code, selected, onClick, perMember }) {
 // admin-only view — reachable at yoursite.netlify.app/?admin=<ADMIN_KEY>
 // nobody using the normal app ever sees this route or a link to it.
 // ---------------------------------------------------------------------------
-function AdminView({ adminKey }) {
-  const [status, setStatus] = useState("loading"); // "loading" | "ok" | "error"
+function AdminView() {
+  const [session, setSession] = useState(undefined); // undefined = checking, null = logged out
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loginError, setLoginError] = useState(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+
+  const [status, setStatus] = useState("idle"); // "idle" | "loading" | "ok" | "error"
   const [leads, setLeads] = useState([]);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    fetchAllLeads(adminKey)
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => setSession(newSession));
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!session) return;
+    setStatus("loading");
+    fetchAllLeads()
       .then((data) => {
         setLeads(data);
         setStatus("ok");
@@ -1224,19 +1251,97 @@ function AdminView({ adminKey }) {
         setError(err.message);
         setStatus("error");
       });
-  }, [adminKey]);
+  }, [session]);
+
+  async function handleLogin(e) {
+    e.preventDefault();
+    setLoginError(null);
+    setLoggingIn(true);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    setLoggingIn(false);
+    if (error) setLoginError(error.message);
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+  }
 
   const totalMembers = leads.reduce((sum, l) => sum + l.members.length, 0);
 
+  const shellStyle = { fontFamily: bodyFont, background: bg, color: ink, minHeight: "100vh", padding: "48px 24px 80px" };
+  const fontImport = (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+      * { box-sizing: border-box; }
+    `}</style>
+  );
+
+  // still checking whether a session already exists
+  if (session === undefined) {
+    return (
+      <div style={shellStyle}>
+        {fontImport}
+        <div style={{ maxWidth: 420, margin: "0 auto" }}>
+          <p style={{ color: inkSoft }}>checking session…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // not logged in — show a real login form, not a URL secret
+  if (!session) {
+    return (
+      <div style={shellStyle}>
+        {fontImport}
+        <div style={{ maxWidth: 420, margin: "0 auto" }}>
+          <div style={{ fontFamily: monoFont, fontSize: 12, letterSpacing: 2, color: teal, textTransform: "uppercase", marginBottom: 10 }}>
+            admin
+          </div>
+          <h1 style={{ fontFamily: displayFont, fontWeight: 500, fontSize: 28, margin: "0 0 20px" }}>log in</h1>
+          <form onSubmit={handleLogin} style={{ background: surface, border: `1px solid ${line}`, borderRadius: 14, padding: "24px 28px" }}>
+            <label style={labelStyle}>email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13, fontFamily: bodyFont, marginTop: 6, marginBottom: 16 }}
+              required
+            />
+            <label style={labelStyle}>password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 6, border: `1px solid ${line}`, fontSize: 13, fontFamily: bodyFont, marginTop: 6, marginBottom: 16 }}
+              required
+            />
+            {loginError && <p style={{ color: red, fontSize: 12, marginTop: -8, marginBottom: 14 }}>{loginError}</p>}
+            <button
+              type="submit"
+              disabled={loggingIn}
+              style={{ background: tealDeep, color: "#fff", border: "none", borderRadius: 8, padding: "11px 20px", fontFamily: bodyFont, fontWeight: 500, fontSize: 14, cursor: "pointer", width: "100%" }}
+            >
+              {loggingIn ? "logging in…" : "log in"}
+            </button>
+          </form>
+          <p style={{ fontSize: 12, color: inkSoft, marginTop: 14, lineHeight: 1.6 }}>
+            this account is created directly in your Supabase project's dashboard (Authentication → Users) — there's no public sign-up form here.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // logged in — show the data
   return (
-    <div style={{ fontFamily: bodyFont, background: bg, color: ink, minHeight: "100vh", padding: "48px 24px 80px" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
-        * { box-sizing: border-box; }
-      `}</style>
+    <div style={shellStyle}>
+      {fontImport}
       <div style={{ maxWidth: 720, margin: "0 auto" }}>
-        <div style={{ fontFamily: monoFont, fontSize: 12, letterSpacing: 2, color: teal, textTransform: "uppercase", marginBottom: 10 }}>
-          admin — not linked anywhere in the app
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+          <div style={{ fontFamily: monoFont, fontSize: 12, letterSpacing: 2, color: teal, textTransform: "uppercase" }}>admin</div>
+          <button onClick={handleLogout} style={{ border: "none", background: "none", color: inkSoft, fontSize: 12, cursor: "pointer" }}>
+            log out
+          </button>
         </div>
         <h1 style={{ fontFamily: displayFont, fontWeight: 500, fontSize: 32, margin: "0 0 24px" }}>saved leads</h1>
 
@@ -1246,9 +1351,6 @@ function AdminView({ adminKey }) {
           <div style={{ background: redSoft, border: `1px solid ${red}`, borderRadius: 10, padding: "16px 20px" }}>
             <div style={{ fontWeight: 500, color: red }}>couldn't load leads</div>
             <p style={{ fontSize: 13, margin: "6px 0 0" }}>{error}</p>
-            <p style={{ fontSize: 12, color: inkSoft, marginTop: 10 }}>
-              check that ADMIN_KEY is set in Netlify's environment variables and matches the key in this URL.
-            </p>
           </div>
         )}
 
@@ -1261,17 +1363,7 @@ function AdminView({ adminKey }) {
               {leads.length > 0 && (
                 <button
                   onClick={() => exportLeadsToExcel(leads)}
-                  style={{
-                    background: tealDeep,
-                    color: "#fff",
-                    border: "none",
-                    borderRadius: 8,
-                    padding: "10px 18px",
-                    fontFamily: bodyFont,
-                    fontWeight: 500,
-                    fontSize: 13,
-                    cursor: "pointer",
-                  }}
+                  style={{ background: tealDeep, color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontFamily: bodyFont, fontWeight: 500, fontSize: 13, cursor: "pointer" }}
                 >
                   ↓ export all to excel
                 </button>
@@ -1282,27 +1374,44 @@ function AdminView({ adminKey }) {
               <p style={{ fontSize: 13, color: inkSoft }}>no leads saved yet.</p>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {leads
-                  .slice()
-                  .sort((a, b) => b.savedAt - a.savedAt)
-                  .map((lead, i) => (
-                    <div key={i} style={{ background: surface, border: `1px solid ${line}`, borderRadius: 10, padding: "14px 18px", fontSize: 13 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between" }}>
-                        <span style={{ fontWeight: 500 }}>{lead.leadName || "unnamed lead"}</span>
-                        <span style={{ color: inkSoft, fontSize: 12 }}>{new Date(lead.savedAt).toLocaleString("en-IN")}</span>
-                      </div>
-                      <div style={{ color: inkSoft, fontSize: 12, marginTop: 4 }}>
-                        pincode {lead.leadPincode || "—"} · {lead.members.length} member{lead.members.length > 1 ? "s" : ""}
-                      </div>
-                      <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: "4px 10px" }}>
-                        {lead.members.map((m) => (
-                          <span key={m.id} style={{ fontSize: 12, textTransform: "capitalize" }}>
-                            {m.relation} ({m.age}){m.conditions.length > 0 && ` — ${m.conditions.join(", ")}`}
-                          </span>
-                        ))}
-                      </div>
+                {leads.map((lead, i) => (
+                  <div key={i} style={{ background: surface, border: `1px solid ${line}`, borderRadius: 10, padding: "14px 18px", fontSize: 13 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ fontWeight: 500 }}>{lead.leadName || "unnamed lead"}</span>
+                      <span style={{ color: inkSoft, fontSize: 12 }}>{new Date(lead.savedAt).toLocaleString("en-IN")}</span>
                     </div>
-                  ))}
+                    <div style={{ color: inkSoft, fontSize: 12, marginTop: 4 }}>
+                      pincode {lead.leadPincode || "—"} · {lead.members.length} member{lead.members.length > 1 ? "s" : ""}
+                    </div>
+                    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {lead.members.map((m) => (
+                        <div key={m.id} style={{ fontSize: 12 }}>
+                          <span style={{ textTransform: "capitalize" }}>{m.relation} ({m.age})</span>
+                          {m.conditions.length > 0 && <span style={{ color: inkSoft }}> — {m.conditions.join(", ")}</span>}
+                          {m.checkupDate && <span style={{ color: inkSoft }}> · checkup {m.checkupDate}</span>}
+                          {m.checkupFile && (
+                            <>
+                              {" "}·{" "}
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    const url = await getCheckupFileUrl(m.checkupFile.path);
+                                    window.open(url, "_blank");
+                                  } catch {
+                                    alert("couldn't open file — it may have been removed from storage");
+                                  }
+                                }}
+                                style={{ border: "none", background: "none", color: teal, cursor: "pointer", fontSize: 12, padding: 0, textDecoration: "underline" }}
+                              >
+                                view {m.checkupFile.fileName}
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
